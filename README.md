@@ -1,0 +1,1 @@
+# stake-testnet-bot
