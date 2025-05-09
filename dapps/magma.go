@@ -11,6 +11,7 @@ import (
 	"time"
 	"strconv"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -22,14 +23,14 @@ import (
 )
 
 const (
-	RPC_URL_MONAD       = "https://testnet-rpc.monad.xyz"
-	CHAIN_ID_MONAD      = 10143
-	GAS_LIMIT_STAKE     = 500000
-	GAS_LIMIT_UNSTAKE   = 800000
-	EXPLORER_BASE_MONAD = "https://testnet.monadexplorer.com/tx/"
-	MAGMA_CONTRACT      = "0x2c9C959516e9AAEdB2C748224a41249202ca8BE7"
-	GMON_CONTRACT       = "0xaEef2f6B429Cb59C9B2D7bB2141ADa993E8571c3"
-	DELAY_SECONDS       = 2
+	RPC_URL_MONAD             = "https://testnet-rpc.monad.xyz"
+	CHAIN_ID_MONAD            = 10143
+	GAS_PRICE_BUFFER_PERCENT  = 10 
+	GAS_LIMIT_BUFFER_PERCENT  = 10
+	EXPLORER_BASE_MONAD       = "https://testnet.monadexplorer.com/tx/"
+	MAGMA_CONTRACT            = "0x2c9C959516e9AAEdB2C748224a41249202ca8BE7"
+	GMON_CONTRACT             = "0xaEef2f6B429Cb59C9B2D7bB2141ADa993E8571c3"
+	DELAY_SECONDS             = 2
 )
 
 var (
@@ -171,11 +172,18 @@ func runUnstakeFlow(privateKeys []string) {
 }
 
 func getPrivateKeys() []string {
-	keysEnv := os.Getenv("PRIVATE_KEYS_WALLET1")
-	if keysEnv == "" {
-		return nil
+	wallets := make([]string, 20)
+	for i := 0; i < 20; i++ {
+		wallets[i] = os.Getenv(fmt.Sprintf("PRIVATE_KEYS_WALLET%d", i+1))
 	}
-	return strings.Split(keysEnv, ",")
+
+	var activeWallets []string
+	for _, key := range wallets {
+		if key != "" {
+			activeWallets = append(activeWallets, key)
+		}
+	}
+	return activeWallets
 }
 
 func showBalances(privateKeys []string) {
@@ -249,12 +257,35 @@ func getGMONBalance(client *ethclient.Client, address common.Address) (*big.Int,
 	return balance, nil
 }
 
+func estimateGasLimit(client *ethclient.Client, from common.Address, to common.Address, value *big.Int, data []byte) (uint64, error) {
+	msg := ethereum.CallMsg{
+		From:  from,
+		To:    &to,
+		Value: value,
+		Data:  data,
+	}
+	gasLimit, err := client.EstimateGas(context.Background(), msg)
+	if err != nil {
+		return 0, fmt.Errorf("failed to estimate gas: %v", err)
+	}
+	
+	gasLimitWithBuffer := gasLimit * (100 + GAS_LIMIT_BUFFER_PERCENT) / 100
+	return gasLimitWithBuffer, nil
+}
+
 func stakeMON(privateKey string, walletIndex, cycle int, amount *big.Int) StakingResult {
 	client, err := ethclient.Dial(RPC_URL_MONAD)
 	if err != nil {
 		return StakingResult{Error: fmt.Errorf("RPC connection failed: %v", err)}
 	}
 	defer client.Close()
+
+	suggestedGasPrice, err := client.SuggestGasPrice(context.Background())
+	if err != nil {
+		return StakingResult{Error: fmt.Errorf("failed to get gas price: %v", err)}
+	}
+	bufferGasPrice := new(big.Int).Mul(suggestedGasPrice, big.NewInt(100+GAS_PRICE_BUFFER_PERCENT))
+	bufferGasPrice.Div(bufferGasPrice, big.NewInt(100))
 
 	pk, err := crypto.HexToECDSA(strings.TrimPrefix(privateKey, "0x"))
 	if err != nil {
@@ -267,18 +298,19 @@ func stakeMON(privateKey string, walletIndex, cycle int, amount *big.Int) Stakin
 		return StakingResult{Error: fmt.Errorf("failed to get nonce: %v", err)}
 	}
 
-	gasPrice, err := client.SuggestGasPrice(context.Background())
+	data := common.FromHex("0xd5575982")
+	gasLimit, err := estimateGasLimit(client, fromAddress, common.HexToAddress(MAGMA_CONTRACT), amount, data)
 	if err != nil {
-		return StakingResult{Error: fmt.Errorf("failed to get gas price: %v", err)}
+		return StakingResult{Error: fmt.Errorf("gas estimation failed: %v", err)}
 	}
 
 	tx := types.NewTransaction(
 		nonce,
 		common.HexToAddress(MAGMA_CONTRACT),
 		amount,
-		GAS_LIMIT_STAKE,
-		gasPrice,
-		common.FromHex("0xd5575982"),
+		gasLimit,
+		bufferGasPrice,
+		data,
 	)
 
 	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(big.NewInt(CHAIN_ID_MONAD)), pk)
@@ -297,7 +329,7 @@ func stakeMON(privateKey string, walletIndex, cycle int, amount *big.Int) Stakin
 	}
 
 	fee := new(big.Float).Quo(
-		new(big.Float).SetInt(new(big.Int).Mul(big.NewInt(int64(receipt.GasUsed)), gasPrice)),
+		new(big.Float).SetInt(new(big.Int).Mul(big.NewInt(int64(receipt.GasUsed)), bufferGasPrice)),
 		new(big.Float).SetInt(big.NewInt(1e18)),
 	)
 	feeStr, _ := fee.Float64()
@@ -325,6 +357,13 @@ func unstakeGMON(privateKey string, walletIndex, cycle int, amount *big.Int) Sta
 	}
 	defer client.Close()
 
+	suggestedGasPrice, err := client.SuggestGasPrice(context.Background())
+	if err != nil {
+		return StakingResult{Error: fmt.Errorf("failed to get gas price: %v", err)}
+	}
+	bufferGasPrice := new(big.Int).Mul(suggestedGasPrice, big.NewInt(100+GAS_PRICE_BUFFER_PERCENT))
+	bufferGasPrice.Div(bufferGasPrice, big.NewInt(100))
+
 	pk, err := crypto.HexToECDSA(strings.TrimPrefix(privateKey, "0x"))
 	if err != nil {
 		return StakingResult{Error: fmt.Errorf("invalid private key: %v", err)}
@@ -336,19 +375,19 @@ func unstakeGMON(privateKey string, walletIndex, cycle int, amount *big.Int) Sta
 		return StakingResult{Error: fmt.Errorf("failed to get nonce: %v", err)}
 	}
 
-	gasPrice, err := client.SuggestGasPrice(context.Background())
-	if err != nil {
-		return StakingResult{Error: fmt.Errorf("failed to get gas price: %v", err)}
-	}
-
 	data := "0x6fed1ea7" + fmt.Sprintf("%064x", amount)
+
+	gasLimit, err := estimateGasLimit(client, fromAddress, common.HexToAddress(MAGMA_CONTRACT), big.NewInt(0), common.FromHex(data))
+	if err != nil {
+		return StakingResult{Error: fmt.Errorf("gas estimation failed: %v", err)}
+	}
 
 	tx := types.NewTransaction(
 		nonce,
 		common.HexToAddress(MAGMA_CONTRACT),
 		big.NewInt(0),
-		GAS_LIMIT_UNSTAKE,
-		gasPrice,
+		gasLimit,
+		bufferGasPrice,
 		common.FromHex(data),
 	)
 
@@ -368,7 +407,7 @@ func unstakeGMON(privateKey string, walletIndex, cycle int, amount *big.Int) Sta
 	}
 
 	fee := new(big.Float).Quo(
-		new(big.Float).SetInt(new(big.Int).Mul(big.NewInt(int64(receipt.GasUsed)), gasPrice)),
+		new(big.Float).SetInt(new(big.Int).Mul(big.NewInt(int64(receipt.GasUsed)), bufferGasPrice)),
 		new(big.Float).SetInt(big.NewInt(1e18)),
 	)
 	feeStr, _ := fee.Float64()
