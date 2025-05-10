@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 	"strconv"
+	"sync"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -25,7 +26,7 @@ import (
 const (
 	RPC_URL_MONAD             = "https://testnet-rpc.monad.xyz"
 	CHAIN_ID_MONAD            = 10143
-	GAS_PRICE_BUFFER_PERCENT  = 10 
+	GAS_PRICE_BUFFER_PERCENT  = 0
 	GAS_LIMIT_BUFFER_PERCENT  = 10
 	EXPLORER_BASE_MONAD       = "https://testnet.monadexplorer.com/tx/"
 	MAGMA_CONTRACT            = "0x2c9C959516e9AAEdB2C748224a41249202ca8BE7"
@@ -86,89 +87,125 @@ func Magma() {
 }
 
 func runStakeFlow(privateKeys []string) {
-	fmt.Println("\nLoading wallet balances...")
-	showBalances(privateKeys)
+    fmt.Println("\nLoading wallet balances...")
+    showBalances(privateKeys)
 
-	fmt.Print("\nEnter amount to stake (in MON): ")
-	reader := bufio.NewReader(os.Stdin)
-	amountStr, _ := reader.ReadString('\n')
-	amountStr = strings.TrimSpace(amountStr)
+    fmt.Print("\nEnter amount to stake (in MON): ")
+    reader := bufio.NewReader(os.Stdin)
+    amountStr, _ := reader.ReadString('\n')
+    amountStr = strings.TrimSpace(amountStr)
 
-	amount, ok := new(big.Float).SetString(amountStr)
-	if !ok {
-		log.Fatal("Invalid amount entered")
-	}
+    amount, ok := new(big.Float).SetString(amountStr)
+    if !ok {
+        log.Fatal("Invalid amount entered")
+    }
 
-	amountWei := new(big.Int)
-	amount.Mul(amount, big.NewFloat(1e18)).Int(amountWei)
+    amountWei := new(big.Int)
+    amount.Mul(amount, big.NewFloat(1e18)).Int(amountWei)
 
-	fmt.Print("Enter number of cycles: ")
-	cyclesStr, _ := reader.ReadString('\n')
-	cyclesStr = strings.TrimSpace(cyclesStr)
+    fmt.Print("Enter number of cycles: ")
+    cyclesStr, _ := reader.ReadString('\n')
+    cyclesStr = strings.TrimSpace(cyclesStr)
 
-	cycles, err := strconv.Atoi(cyclesStr)
-	if err != nil || cycles <= 0 {
-		log.Fatal("Please enter a valid positive number")
-	}
+    cycles, err := strconv.Atoi(cyclesStr)
+    if err != nil || cycles <= 0 {
+        log.Fatal("Please enter a valid positive number")
+    }
 
-	fmt.Printf("\nPreparing to stake %s MON for %d cycles across %d wallets\n", amountStr, cycles, len(privateKeys))
+    fmt.Printf("\nPreparing to stake %s MON for %d cycles across %d wallets\n", amountStr, cycles, len(privateKeys))
 
-	for walletIdx, privateKey := range privateKeys {
-		for cycle := 1; cycle <= cycles; cycle++ {
-			result := stakeMON(privateKey, walletIdx+1, cycle, amountWei)
-			printStakingResult(result)
+    var wg sync.WaitGroup
+    results := make(chan StakingResult, cycles)
+    walletMutexes := make([]sync.Mutex, len(privateKeys))
 
-			if cycle < cycles {
-				time.Sleep(DELAY_SECONDS * time.Second)
-			}
-		}
-	}
+    for i := 0; i < cycles; i++ {
+        wg.Add(1)
+        walletIndex := i % len(privateKeys)
+        
+        go func(cycleNum, walletIdx int) {
+            defer wg.Done()
+            time.Sleep(time.Duration(cycleNum*DELAY_SECONDS) * time.Second)
+            
+            walletMutexes[walletIdx].Lock()
+            defer walletMutexes[walletIdx].Unlock()
 
-	fmt.Println(green("\n✅ STAKING COMPLETED"))
-	fmt.Println("Follow X : 0xNekowawolf\n")
+            result := stakeMON(privateKeys[walletIdx], walletIdx+1, cycleNum+1, amountWei)
+            results <- result
+        }(i, walletIndex)
+    }
+
+    go func() {
+        wg.Wait()
+        close(results)
+    }()
+
+    for result := range results {
+        printStakingResult(result)
+    }
+
+    fmt.Println(green("\n✅ STAKING COMPLETED"))
+    fmt.Println("Follow X : 0xNekowawolf\n")
 }
 
 func runUnstakeFlow(privateKeys []string) {
-	fmt.Println("\nLoading wallet balances...")
-	showBalances(privateKeys)
+    fmt.Println("\nLoading wallet balances...")
+    showBalances(privateKeys)
 
-	fmt.Print("\nEnter amount to unstake (in gMON): ")
-	reader := bufio.NewReader(os.Stdin)
-	amountStr, _ := reader.ReadString('\n')
-	amountStr = strings.TrimSpace(amountStr)
+    fmt.Print("\nEnter amount to unstake (in gMON): ")
+    reader := bufio.NewReader(os.Stdin)
+    amountStr, _ := reader.ReadString('\n')
+    amountStr = strings.TrimSpace(amountStr)
 
-	amount, ok := new(big.Float).SetString(amountStr)
-	if !ok {
-		log.Fatal("Invalid amount entered")
-	}
+    amount, ok := new(big.Float).SetString(amountStr)
+    if !ok {
+        log.Fatal("Invalid amount entered")
+    }
 
-	amountWei := new(big.Int)
-	amount.Mul(amount, big.NewFloat(1e18)).Int(amountWei)
+    amountWei := new(big.Int)
+    amount.Mul(amount, big.NewFloat(1e18)).Int(amountWei)
 
-	fmt.Print("Enter number of cycles: ")
-	cyclesStr, _ := reader.ReadString('\n')
-	cyclesStr = strings.TrimSpace(cyclesStr)
+    fmt.Print("Enter number of cycles: ")
+    cyclesStr, _ := reader.ReadString('\n')
+    cyclesStr = strings.TrimSpace(cyclesStr)
 
-	cycles, err := strconv.Atoi(cyclesStr)
-	if err != nil || cycles <= 0 {
-		log.Fatal("Please enter a valid positive number")
-	}
+    cycles, err := strconv.Atoi(cyclesStr)
+    if err != nil || cycles <= 0 {
+        log.Fatal("Please enter a valid positive number")
+    }
 
-	fmt.Printf("\nPreparing to unstake %s gMON for %d cycles across %d wallets\n", amountStr, cycles, len(privateKeys))
+    fmt.Printf("\nPreparing to unstake %s gMON for %d cycles across %d wallets\n", amountStr, cycles, len(privateKeys))
 
-	for walletIdx, privateKey := range privateKeys {
-		for cycle := 1; cycle <= cycles; cycle++ {
-			result := unstakeGMON(privateKey, walletIdx+1, cycle, amountWei)
-			printStakingResult(result)
+    var wg sync.WaitGroup
+    results := make(chan StakingResult, cycles)
+    walletMutexes := make([]sync.Mutex, len(privateKeys))
 
-			if cycle < cycles {
-				time.Sleep(DELAY_SECONDS * time.Second)
-			}
-		}
-	}
+    for i := 0; i < cycles; i++ {
+        wg.Add(1)
+        walletIndex := i % len(privateKeys)
+        
+        go func(cycleNum, walletIdx int) {
+            defer wg.Done()
+            time.Sleep(time.Duration(cycleNum*DELAY_SECONDS) * time.Second)
+            
+            walletMutexes[walletIdx].Lock()
+            defer walletMutexes[walletIdx].Unlock()
 
-	fmt.Println(green("\n✅ UNSTAKING COMPLETED"))
-	fmt.Println("Follow X : 0xNekowawolf\n")
+            result := unstakeGMON(privateKeys[walletIdx], walletIdx+1, cycleNum+1, amountWei)
+            results <- result
+        }(i, walletIndex)
+    }
+
+    go func() {
+        wg.Wait()
+        close(results)
+    }()
+
+    for result := range results {
+        printStakingResult(result)
+    }
+
+    fmt.Println(green("\n✅ UNSTAKING COMPLETED"))
+    fmt.Println("Follow X : 0xNekowawolf\n")
 }
 
 func getPrivateKeys() []string {
