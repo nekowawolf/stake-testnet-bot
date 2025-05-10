@@ -40,6 +40,7 @@ var (
 	green   = color.New(color.FgGreen).SprintFunc()
 	red     = color.New(color.FgRed).SprintFunc()
 	magenta = color.New(color.FgMagenta).SprintFunc()
+	blue    = color.New(color.FgBlue).SprintFunc()
 )
 
 type StakingResult struct {
@@ -477,7 +478,7 @@ func printStakingResult(result StakingResult) {
 		fmt.Printf("Amount: %s\n", magenta(result.Amount))
 		fmt.Printf("TxHash: %s\n", yellow(shortenHash(result.TxHash)))
 		fmt.Printf("Fee: %s\n", yellow(result.Fee))
-		fmt.Printf("Explorer: %s%s\n", EXPLORER_BASE_MONAD, result.TxHash)
+		fmt.Printf("Explorer: %s\n", blue(fmt.Sprintf("%s%s", EXPLORER_BASE_MONAD, result.TxHash)))
 
 		client, err := ethclient.Dial(RPC_URL_MONAD)
 		if err == nil {
